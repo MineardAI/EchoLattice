@@ -170,7 +170,7 @@ def t_ground(text: str) -> str:
 
 DEFAULT_PIPELINE = ["Mirror", "Invert", "Symbolize", "Abstract", "Ground"]
 # Nodes produced by these transforms never recurse further.
-TERMINAL_TRANSFORMS = {"Ground"}
+TERMINAL_TRANSFORMS = {"Ground", "Abstract"}
 
 
 # ---------------------------
@@ -214,7 +214,10 @@ class Recursor:
             )
         )
 
-        def _recurse(parent_id: str, text: str, depth: int):
+        def _recurse(parent_id: str, text: str, depth: int, parent_transform: str):
+            # If the parent was terminal, do not generate children from it.
+            if parent_transform in TERMINAL_TRANSFORMS:
+                return
             if depth >= self.max_depth:
                 return
             elapsed_min = (now_ts() - start) / 60.0
@@ -238,9 +241,9 @@ class Recursor:
                 edges.append(EchoEdge(src_id=parent_id, dst_id=node_id, relation="transforms_to"))
                 if name in TERMINAL_TRANSFORMS:
                     continue
-                _recurse(node_id, out, depth + 1)
+                _recurse(node_id, out, depth + 1, name)
 
-        _recurse(root_id, seed, 0)
+        _recurse(root_id, seed, 0, "Seed")
         return EchoGraph(meta=meta, nodes=nodes, edges=edges)
 
 
@@ -410,6 +413,13 @@ def _run_tests() -> int:
         # Test 8: run_tests flags return 0 without prompting (fast-path)
         assert main(["--run_tests"]) == 0, "Expected main(['--run_tests']) to return 0"
         assert main(["--run-tests"]) == 0, "Expected main(['--run-tests']) to return 0"
+
+        # Test 8: Terminal transforms (Ground, Abstract) must have no outgoing edges
+        rec2 = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=4, max_minutes=1)
+        g2 = rec2.recurse("Seed Bearer", consent=True)
+        by_id = {n.id: n for n in g2.nodes}
+        for e in g2.edges:
+            assert by_id[e.src_id].transform not in TERMINAL_TRANSFORMS
 
         return 0
     finally:
