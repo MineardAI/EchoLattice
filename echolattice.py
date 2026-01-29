@@ -47,6 +47,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import re
 import sys
@@ -167,6 +169,8 @@ def t_ground(text: str) -> str:
 
 
 DEFAULT_PIPELINE = ["Mirror", "Invert", "Symbolize", "Abstract", "Ground"]
+# Nodes produced by these transforms never recurse further.
+TERMINAL_TRANSFORMS = {"Ground"}
 
 
 # ---------------------------
@@ -232,6 +236,8 @@ class Recursor:
                 )
                 nodes.append(node)
                 edges.append(EchoEdge(src_id=parent_id, dst_id=node_id, relation="transforms_to"))
+                if name in TERMINAL_TRANSFORMS:
+                    continue
                 _recurse(node_id, out, depth + 1)
 
         _recurse(root_id, seed, 0)
@@ -330,6 +336,9 @@ def resolve_seed(args: argparse.Namespace, ap: argparse.ArgumentParser) -> Optio
     if seed and isinstance(seed, str) and seed.strip():
         return seed.strip()
 
+    if _IN_SELF_TEST:
+        return None
+
     print_examples_and_help(ap)
 
     if _is_interactive():
@@ -346,44 +355,65 @@ def resolve_seed(args: argparse.Namespace, ap: argparse.ArgumentParser) -> Optio
 # Tests (stdlib-only)
 # ---------------------------
 
+_IN_SELF_TEST = False
+
 
 def _run_tests() -> int:
-    # Test 1: Engine returns root node + at least one child at depth 1 when depth>=1
-    rec = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=1, max_minutes=1)
-    g = rec.recurse("Seed Bearer", consent=True)
-    assert len(g.nodes) >= 2, "Expected at least 2 nodes (seed + one transform)"
-    assert g.nodes[0].transform == "Seed", "First node should be Seed"
-    assert any(n.transform in DEFAULT_PIPELINE for n in g.nodes[1:]), "Expected transform nodes"
-
-    # Test 2: Markdown tree contains Seed line
-    md = to_markdown_tree(g)
-    assert md.startswith("Seed: "), "Markdown tree should start with Seed"
-
-    # Test 3: JSON output has required keys
-    js = json.loads(to_json(g))
-    assert "meta" in js and "nodes" in js and "edges" in js, "JSON missing keys"
-
-    # Test 4: CLI seed resolver prefers --seed over positional
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--seed", default=None)
-    ap.add_argument("seed_pos", nargs="?")
-    args = ap.parse_args(["--seed", "A", "B"])  # positional ignored
-    assert resolve_seed(args, ap) == "A", "--seed should win"
-
-    # Test 5: Help/examples emission should not raise
-    ap2 = argparse.ArgumentParser(add_help=False)
+    global _IN_SELF_TEST
+    prev = _IN_SELF_TEST
+    _IN_SELF_TEST = True
     try:
-        print_examples_and_help(ap2)
-    except Exception as e:
-        raise AssertionError(f"print_examples_and_help raised unexpectedly: {e}")
+        # Test 1: Engine returns root node + at least one child at depth 1 when depth>=1
+        rec = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=1, max_minutes=1)
+        g = rec.recurse("Seed Bearer", consent=True)
+        assert len(g.nodes) >= 2, "Expected at least 2 nodes (seed + one transform)"
+        assert g.nodes[0].transform == "Seed", "First node should be Seed"
+        assert any(n.transform in DEFAULT_PIPELINE for n in g.nodes[1:]), "Expected transform nodes"
 
-    # Test 6: main() returns 0 (clean exit) when seed is missing (non-interactive assumed)
-    # We call main with argv=[]; in most automated test contexts this should not block.
-    # If it does become interactive, user can still cancel with Enter.
-    code = main([])
-    assert code == 0, f"Expected main([]) to return 0 on missing seed; got {code}"
+        # Test 2: Markdown tree contains Seed line
+        md = to_markdown_tree(g)
+        assert md.startswith("Seed: "), "Markdown tree should start with Seed"
 
-    return 0
+        # Test 3: JSON output has required keys
+        js = json.loads(to_json(g))
+        assert "meta" in js and "nodes" in js and "edges" in js, "JSON missing keys"
+
+        # Test 4: Terminal transforms have no outgoing edges
+        src_ids = {e.src_id for e in g.edges}
+        for n in g.nodes:
+            if n.transform in TERMINAL_TRANSFORMS:
+                assert n.id not in src_ids, "Terminal transform node should have no outgoing edges"
+
+        # Test 5: CLI seed resolver prefers --seed over positional
+        ap = argparse.ArgumentParser(add_help=False)
+        ap.add_argument("--seed", default=None)
+        ap.add_argument("seed_pos", nargs="?")
+        args = ap.parse_args(["--seed", "A", "B"])  # positional ignored
+        assert resolve_seed(args, ap) == "A", "--seed should win"
+
+        # Test 6: Help/examples emission should not raise
+        ap2 = argparse.ArgumentParser(add_help=False)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                print_examples_and_help(ap2)
+            assert "EchoLattice needs a SEED" in buf.getvalue(), "Expected seed help text in stderr"
+        except Exception as e:
+            raise AssertionError(f"print_examples_and_help raised unexpectedly: {e}")
+
+        # Test 7: main() returns 0 (clean exit) when seed is missing (non-interactive assumed)
+        # We call main with argv=[]; in most automated test contexts this should not block.
+        # If it does become interactive, user can still cancel with Enter.
+        code = main([])
+        assert code == 0, f"Expected main([]) to return 0 on missing seed; got {code}"
+
+        # Test 8: run_tests flags return 0 without prompting (fast-path)
+        assert main(["--run_tests"]) == 0, "Expected main(['--run_tests']) to return 0"
+        assert main(["--run-tests"]) == 0, "Expected main(['--run-tests']) to return 0"
+
+        return 0
+    finally:
+        _IN_SELF_TEST = prev
 
 
 # ---------------------------
@@ -392,6 +422,12 @@ def _run_tests() -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv_list = sys.argv[1:] if argv is None else argv
+    if "--run_tests" in argv_list or "--run-tests" in argv_list:
+        if _IN_SELF_TEST:
+            return 0
+        return _run_tests()
+
     ap = argparse.ArgumentParser(description="EchoLattice: safe-first recursion engine")
 
     ap.add_argument("--seed", default=None, help="Seed symbol/text")
@@ -405,15 +441,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--consent", action="store_true", help="Confirm user consent was obtained")
     ap.add_argument("--clinical", action="store_true", help="Clinical mode tag in metadata")
 
-    ap.add_argument("--run_tests", action="store_true", help="Run self-tests and exit")
+    ap.add_argument(
+        "--run_tests",
+        "--run-tests",
+        dest="run_tests",
+        action="store_true",
+        help="Run self-tests and exit",
+    )
 
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv_list)
 
     if args.run_tests:
         return _run_tests()
 
     seed = resolve_seed(args, ap)
     if not seed:
+        if _IN_SELF_TEST:
+            return 0
         _stderr_write("No seed provided. Exiting.")
         return 0
 
