@@ -1,0 +1,14 @@
+[project]
+name = "echolattice"
+version = "0.2.2"
+description = "Safe-first recursion reference implementation (stdlib-only)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Tyrone Mineard"}]
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
