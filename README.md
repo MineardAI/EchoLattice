@@ -1,5 +1,9 @@
 # EchoLattice (Reference Implementation)
 
+##  Note from creator:
+This is more recursion engine/playground than a "therapy based" recursion solution.
+I built this early in my resursion work and posted it in case anyone wanted to mess around
+
 A minimal, safe-first recursion engine that transforms a seed symbol through canonical transforms
 (Mirror, Invert, Symbolize, Abstract, Ground) and emits an "Echo Map" as JSON + Markdown.
 
