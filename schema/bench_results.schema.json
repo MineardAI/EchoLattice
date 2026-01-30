@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bench_results.schema.json",
+  "title": "Bench Results JSONL Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "seed",
+    "category",
+    "config",
+    "structure",
+    "loopiness",
+    "ground",
+    "policy",
+    "human_closure_rating"
+  ],
+  "properties": {
+    "seed": { "type": "string" },
+    "category": { "type": "string" },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["novelty", "depth", "branching", "rng_seed"],
+      "properties": {
+        "novelty": { "type": ["number", "null"] },
+        "depth": { "type": "number" },
+        "branching": { "type": ["number", "null"] },
+        "rng_seed": { "type": "number" }
+      }
+    },
+    "structure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node_count",
+        "edge_count",
+        "unique_nodes",
+        "max_depth_reached",
+        "transform_counts",
+        "dedup_saved"
+      ],
+      "properties": {
+        "node_count": { "type": "number" },
+        "edge_count": { "type": "number" },
+        "unique_nodes": { "type": "number" },
+        "max_depth_reached": { "type": "number" },
+        "transform_counts": { "type": "object" },
+        "dedup_saved": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "loopiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loop_pattern_hits", "invert_nesting_max"],
+      "properties": {
+        "loop_pattern_hits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["echo_of", "shadow_of", "symbols", "total"],
+          "properties": {
+            "echo_of": { "type": "number" },
+            "shadow_of": { "type": "number" },
+            "symbols": { "type": "number" },
+            "total": { "type": "number" }
+          }
+        },
+        "invert_nesting_max": { "type": "number" }
+      }
+    },
+    "ground": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ground_nodes_count",
+        "selected_ground_text",
+        "ground_channel",
+        "ground_sigils",
+        "ground_path",
+        "branches_ending_in_ground",
+        "avg_novelty_to_ground",
+        "ground_hash"
+      ],
+      "properties": {
+        "ground_nodes_count": { "type": "number" },
+        "selected_ground_text": { "type": ["string", "null"] },
+        "ground_channel": {
+          "type": ["string", "null"],
+          "enum": ["writing", "breath", "movement", "social", "environment", null]
+        },
+        "ground_sigils": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "ground_path": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "branches_ending_in_ground": { "type": "number" },
+        "avg_novelty_to_ground": { "type": ["number", "null"] },
+        "ground_hash": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{8}$"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "mode", "public_safe", "redactions", "notes", "decision"],
+      "properties": {
+        "version": { "type": "string" },
+        "mode": { "type": "string" },
+        "public_safe": { "type": "boolean", "const": true },
+        "redactions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "notes": { "type": "string" },
+        "decision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "severity", "reason_codes", "inputs"],
+          "properties": {
+            "action": { "type": "string" },
+            "severity": { "type": "number", "minimum": 0, "maximum": 1 },
+            "reason_codes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "inputs": { "type": "object" }
+          }
+        }
+      }
+    },
+    "human_closure_rating": { "type": "null" }
+  }
+}
