@@ -50,8 +50,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import random
 import re
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -71,6 +74,7 @@ class EchoNode:
     parent_id: Optional[str]
     tags: List[str]
     timestamp: float
+    occurrences: int = 1
 
 
 @dataclass
@@ -114,6 +118,8 @@ def register_transform(name: str):
 
 @register_transform("Mirror")
 def t_mirror(text: str) -> str:
+    if text.startswith("Echo of [") or text.count("Echo of [") > 1:
+        return text
     return f"Echo of [{text}] returns as self-reflection."  # gentle mirror
 
 
@@ -136,6 +142,8 @@ def t_invert(text: str) -> str:
 
 @register_transform("Symbolize")
 def t_symbolize(text: str) -> str:
+    if text.startswith("Symbols:"):
+        return text
     table = {
         "Echoholder": "The Mirror-Guardian",
         "Zahaviel": "The Watcher at the Gate",
@@ -160,12 +168,32 @@ def t_abstract(text: str) -> str:
 
 @register_transform("Ground")
 def t_ground(text: str) -> str:
-    hint = "Create a 1-page sketch that captures the idea and share it with one trusted person."
-    if "Blade" in text or "Fang" in text:
-        hint = "List 3 things to cut away this week (noise, obligation, distraction). Do the first today."
-    if "Mirror" in text or "Echo" in text:
-        hint = "Write 5 sentences that reflect what this means to you now. Read them aloud once."
-    return f"Action: {hint}"
+    tokens = re.findall(r"[A-Za-z][A-Za-z\-]+", text.lower())
+    words = [t for t in tokens if len(t) > 2]
+    themes = []
+    for w in words:
+        if w not in themes:
+            themes.append(w)
+        if len(themes) == 2:
+            break
+
+    rules = [
+        ({"loop", "cycle", "repeat"}, "Step away for 5 minutes, then return and do one small change."),
+        ({"fear", "afraid", "anxiety"}, "Take 6 slow breaths, then call or text a trusted friend."),
+        ({"mirror", "echo", "reflection"}, "Write 3 honest sentences, then read them once out loud."),
+        ({"blade", "fang", "cut"}, "List 3 things to cut away; drop the easiest one today."),
+        ({"ground", "earth", "root"}, "Stand up, feel your feet, and name 3 things you can see."),
+    ]
+    for keys, action in rules:
+        if any(k in words for k in keys):
+            return f"Action: {action}"
+
+    if themes:
+        theme = " / ".join(themes[:2])
+        action = f"Pick one small step for {theme}; write it down and do it for 5 minutes."
+    else:
+        action = "Pick one small next step; write it down and do it for 5 minutes."
+    return f"Action: {action}"
 
 
 DEFAULT_PIPELINE = ["Mirror", "Invert", "Symbolize", "Abstract", "Ground"]
@@ -181,12 +209,58 @@ TERMINAL_TRANSFORMS = {"Ground", "Abstract"}
 def now_ts() -> float:
     return time.time()
 
+def novelty_score(parent_text: str, candidate_text: str) -> float:
+    def words(s: str) -> set:
+        return set(re.findall(r"[A-Za-z][A-Za-z\\-]+", s.lower()))
+
+    a = words(parent_text)
+    b = words(candidate_text)
+    if not a and not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    inter = a & b
+    return 1.0 - (len(inter) / len(union))
 
 class Recursor:
-    def __init__(self, pipeline: List[str], max_depth: int, max_minutes: int = 30):
+    def __init__(
+        self,
+        pipeline: List[str],
+        max_depth: int,
+        max_minutes: int = 30,
+        branching: Optional[int] = None,
+        rng_seed: Optional[int] = None,
+        novelty_threshold: Optional[float] = None,
+    ):
         self.pipeline = pipeline
         self.max_depth = max_depth
         self.max_minutes = max_minutes
+        self.branching = branching
+        self.rng = random.Random(rng_seed)
+        self.novelty_threshold = novelty_threshold
+
+    def _select_transforms(self) -> List[str]:
+        pipeline = self.pipeline[:]
+        ground_in_pipeline = "Ground" in pipeline
+        non_ground = [name for name in pipeline if name != "Ground"]
+
+        branching = self.branching
+        if branching is None:
+            selected = non_ground
+        else:
+            if branching < 1:
+                branching = 1
+            max_non_ground = max(branching - (1 if ground_in_pipeline else 0), 0)
+            if max_non_ground >= len(non_ground):
+                selected = non_ground
+            else:
+                selected = self.rng.sample(non_ground, k=max_non_ground)
+
+        ordered = [name for name in pipeline if name in selected and name != "Ground"]
+        if ground_in_pipeline:
+            ordered.append("Ground")
+        return ordered
 
     def recurse(self, seed: str, consent: bool = True, safety_level: str = "light") -> EchoGraph:
         start = now_ts()
@@ -200,21 +274,25 @@ class Recursor:
 
         nodes: List[EchoNode] = []
         edges: List[EchoEdge] = []
+        node_index: Dict[tuple, EchoNode] = {}
+        edge_index: set = set()
+        session_grounded = False
 
         root_id = str(uuid.uuid4())
-        nodes.append(
-            EchoNode(
-                id=root_id,
-                text=seed,
-                transform="Seed",
-                depth=0,
-                parent_id=None,
-                tags=["seed"],
-                timestamp=now_ts(),
-            )
+        root_node = EchoNode(
+            id=root_id,
+            text=seed,
+            transform="Seed",
+            depth=0,
+            parent_id=None,
+            tags=["seed"],
+            timestamp=now_ts(),
         )
+        nodes.append(root_node)
+        node_index[(root_node.transform, root_node.text)] = root_node
 
         def _recurse(parent_id: str, text: str, depth: int, parent_transform: str):
+            nonlocal session_grounded
             # If the parent was terminal, do not generate children from it.
             if parent_transform in TERMINAL_TRANSFORMS:
                 return
@@ -224,9 +302,26 @@ class Recursor:
             if elapsed_min > self.max_minutes:
                 return
 
-            for name in self.pipeline:
+            for name in self._select_transforms():
+                if name == "Ground" and session_grounded:
+                    continue
                 fn = TRANSFORMS[name]
                 out = fn(text)
+                if self.novelty_threshold is not None:
+                    score = novelty_score(text, out)
+                    if score < self.novelty_threshold:
+                        continue
+                existing = node_index.get((name, out))
+                if existing is not None:
+                    existing.occurrences += 1
+                    if parent_id != existing.id:
+                        edge_key = (parent_id, existing.id)
+                        if edge_key not in edge_index:
+                            edges.append(
+                                EchoEdge(src_id=parent_id, dst_id=existing.id, relation="transforms_to")
+                            )
+                            edge_index.add(edge_key)
+                    continue
                 node_id = str(uuid.uuid4())
                 node = EchoNode(
                     id=node_id,
@@ -238,7 +333,12 @@ class Recursor:
                     timestamp=now_ts(),
                 )
                 nodes.append(node)
+                node_index[(name, out)] = node
+                edge_key = (parent_id, node_id)
                 edges.append(EchoEdge(src_id=parent_id, dst_id=node_id, relation="transforms_to"))
+                edge_index.add(edge_key)
+                if name == "Ground":
+                    session_grounded = True
                 if name in TERMINAL_TRANSFORMS:
                     continue
                 _recurse(node_id, out, depth + 1, name)
@@ -288,6 +388,66 @@ def to_markdown_tree(graph: EchoGraph) -> str:
 
     walk(root.id)
     return "\n".join(lines)
+
+def to_summary_md(graph: EchoGraph) -> str:
+    nodes_by_id = {n.id: n for n in graph.nodes}
+    seed_node = next((n for n in graph.nodes if n.transform == "Seed"), None)
+    seed_text = seed_node.text if seed_node else "(none)"
+
+    scored = []
+    for n in graph.nodes:
+        if n.parent_id is None:
+            continue
+        parent = nodes_by_id.get(n.parent_id)
+        if parent is None:
+            continue
+        score = novelty_score(parent.text, n.text)
+        scored.append((score, n))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top = scored[:3]
+
+    ground_node = next((n for n in graph.nodes if n.transform == "Ground"), None)
+    ground_text = ground_node.text if ground_node else "(none)"
+
+    lines: List[str] = []
+    lines.append("Seed")
+    lines.append(seed_text)
+    lines.append("")
+    lines.append("Top 3 most novel nodes")
+    if top:
+        for i, (_, n) in enumerate(top, start=1):
+            lines.append(f"{i}. {n.transform}: {n.text}")
+    else:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("Final Ground action")
+    lines.append(ground_text)
+    lines.append("")
+    lines.append("Total nodes/edges")
+    lines.append(f"Nodes: {len(graph.nodes)}")
+    lines.append(f"Edges: {len(graph.edges)}")
+    return "\n".join(lines)
+
+def pick_cooldown_message(rng: random.Random, clinical: bool) -> str:
+    general = [
+        "Session complete. Close the file, take 3 slow breaths, and return to your day.",
+        "Session complete. Stand up, drink water, and look at something far away for 30 seconds.",
+        "Session complete. Write one real-world next step on paper, then stop here.",
+        "Session complete. Take a short walk—no more prompts for the next 10 minutes.",
+        "Session complete. Text one trusted person something ordinary and grounding.",
+        "Session complete. Stretch your shoulders and unclench your jaw.",
+        "Session complete. Save the summary, then step away from the screen.",
+        "Session complete. Notice 5 things you can see, 4 you can feel, 3 you can hear.",
+        "Session complete. Do one small task (dishes, laundry, fresh air) before returning.",
+        "Session complete. This session is closed—rest is part of the method.",
+    ]
+    clinical_safe = [
+        "Session complete. Pause here and reconnect with your immediate surroundings.",
+        "Session complete. If you feel unsettled, take a break and talk with someone supportive.",
+        "Session complete. Grounding first—sleep, food, and routine matter more than analysis.",
+    ]
+    pool = clinical_safe if clinical else general
+    return rng.choice(pool)
 
 
 # ---------------------------
@@ -367,34 +527,97 @@ def _run_tests() -> int:
     _IN_SELF_TEST = True
     try:
         # Test 1: Engine returns root node + at least one child at depth 1 when depth>=1
-        rec = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=1, max_minutes=1)
+        rec = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=1, max_minutes=1, rng_seed=123)
         g = rec.recurse("Seed Bearer", consent=True)
         assert len(g.nodes) >= 2, "Expected at least 2 nodes (seed + one transform)"
         assert g.nodes[0].transform == "Seed", "First node should be Seed"
         assert any(n.transform in DEFAULT_PIPELINE for n in g.nodes[1:]), "Expected transform nodes"
 
-        # Test 2: Markdown tree contains Seed line
+        # Test 2: Branching limit reduces node count
+        rec_full = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=2, max_minutes=1, rng_seed=7)
+        g_full = rec_full.recurse("Seed Bearer", consent=True)
+        rec_limited = Recursor(
+            pipeline=DEFAULT_PIPELINE,
+            max_depth=2,
+            max_minutes=1,
+            branching=1,
+            rng_seed=7,
+        )
+        g_limited = rec_limited.recurse("Seed Bearer", consent=True)
+        assert len(g_limited.nodes) < len(g_full.nodes), "Branching should reduce node count"
+
+        # Test 3: Dedup reduces duplicates for repeated transforms
+        if "Const" not in TRANSFORMS:
+            @register_transform("Const")
+            def t_const(text: str) -> str:
+                return "same"
+
+        rec_dedup = Recursor(pipeline=["Const", "Ground"], max_depth=2, max_minutes=1, rng_seed=1)
+        g_dedup = rec_dedup.recurse("Alpha", consent=True)
+        const_nodes = [n for n in g_dedup.nodes if n.transform == "Const"]
+        assert len(const_nodes) == 1, "Expected a single Const node after dedup"
+        assert const_nodes[0].occurrences >= 2, "Expected dedup to increment occurrences"
+        assert len(g_dedup.nodes) == 3, "Expected reduced node count with dedup"
+        assert any(e.dst_id == const_nodes[0].id for e in g_dedup.edges), "Expected edge to Const node"
+
+        # Test 4: Mirror should not produce nested "Echo of"
+        rec_mirror = Recursor(pipeline=["Mirror"], max_depth=2, max_minutes=1, rng_seed=2)
+        g_mirror = rec_mirror.recurse("Seed Bearer", consent=True)
+        assert not any("Echo of [Echo of" in n.text for n in g_mirror.nodes), "Nested Echo not allowed"
+
+        # Test 5: Symbolize is idempotent
+        assert t_symbolize("Symbols: Echoholder") == "Symbols: Echoholder", "Symbolize should be idempotent"
+        assert "Symbols: Symbols:" not in t_symbolize("Symbols: X"), "No double Symbols prefix"
+
+        # Test 6: Low-novelty transforms are skipped
+        if "Repeat" not in TRANSFORMS:
+            @register_transform("Repeat")
+            def t_repeat(text: str) -> str:
+                return text
+
+        rec_novel = Recursor(
+            pipeline=["Repeat", "Ground"],
+            max_depth=1,
+            max_minutes=1,
+            novelty_threshold=0.1,
+            rng_seed=3,
+        )
+        g_novel = rec_novel.recurse("Seed Bearer", consent=True)
+        assert not any(n.transform == "Repeat" for n in g_novel.nodes), "Repeat should be skipped"
+
+        # Test 7: Only one Ground node per session when depth > 2
+        rec_ground = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=3, max_minutes=1, rng_seed=9)
+        g_ground = rec_ground.recurse("Seed Bearer", consent=True)
+        ground_nodes = [n for n in g_ground.nodes if n.transform == "Ground"]
+        assert len(ground_nodes) == 1, "Expected only one Ground node per session"
+
+        # Test 8: Markdown tree contains Seed line
         md = to_markdown_tree(g)
         assert md.startswith("Seed: "), "Markdown tree should start with Seed"
 
-        # Test 3: JSON output has required keys
+        # Test 9: JSON output has required keys
         js = json.loads(to_json(g))
         assert "meta" in js and "nodes" in js and "edges" in js, "JSON missing keys"
 
-        # Test 4: Terminal transforms have no outgoing edges
+        # Test 10: Terminal transforms have no outgoing edges
         src_ids = {e.src_id for e in g.edges}
         for n in g.nodes:
             if n.transform in TERMINAL_TRANSFORMS:
                 assert n.id not in src_ids, "Terminal transform node should have no outgoing edges"
 
-        # Test 5: CLI seed resolver prefers --seed over positional
+        # Test 11: Ground output should vary with input
+        g_loop = t_ground("stuck in a loop")
+        g_fear = t_ground("a moment of fear")
+        assert g_loop != g_fear, "Ground actions should change when input changes"
+
+        # Test 12: CLI seed resolver prefers --seed over positional
         ap = argparse.ArgumentParser(add_help=False)
         ap.add_argument("--seed", default=None)
         ap.add_argument("seed_pos", nargs="?")
         args = ap.parse_args(["--seed", "A", "B"])  # positional ignored
         assert resolve_seed(args, ap) == "A", "--seed should win"
 
-        # Test 6: Help/examples emission should not raise
+        # Test 13: Help/examples emission should not raise
         ap2 = argparse.ArgumentParser(add_help=False)
         try:
             buf = io.StringIO()
@@ -404,18 +627,44 @@ def _run_tests() -> int:
         except Exception as e:
             raise AssertionError(f"print_examples_and_help raised unexpectedly: {e}")
 
-        # Test 7: main() returns 0 (clean exit) when seed is missing (non-interactive assumed)
+        # Test 14: Summary file generation works
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_json = os.path.join(tmpdir, "echo_map.json")
+            out_md = os.path.join(tmpdir, "echo_map.md")
+            out_summary = os.path.join(tmpdir, "echo_summary.md")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = main(
+                    [
+                        "--seed",
+                        "Seed Bearer",
+                        "--depth",
+                        "1",
+                        "--out_json",
+                        out_json,
+                        "--out_md",
+                        out_md,
+                        "--out_summary",
+                        out_summary,
+                    ]
+                )
+            assert code == 0, f"Expected main(...) to return 0; got {code}"
+            assert os.path.exists(out_summary), "Summary file was not created"
+            with open(out_summary, "r", encoding="utf-8") as f:
+                summary = f.read()
+            assert "Seed" in summary and "Top 3 most novel nodes" in summary, "Summary missing sections"
+
+        # Test 15: main() returns 0 (clean exit) when seed is missing (non-interactive assumed)
         # We call main with argv=[]; in most automated test contexts this should not block.
         # If it does become interactive, user can still cancel with Enter.
         code = main([])
         assert code == 0, f"Expected main([]) to return 0 on missing seed; got {code}"
 
-        # Test 8: run_tests flags return 0 without prompting (fast-path)
+        # Test 16: run_tests flags return 0 without prompting (fast-path)
         assert main(["--run_tests"]) == 0, "Expected main(['--run_tests']) to return 0"
         assert main(["--run-tests"]) == 0, "Expected main(['--run-tests']) to return 0"
 
-        # Test 8: Terminal transforms (Ground, Abstract) must have no outgoing edges
-        rec2 = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=4, max_minutes=1)
+        # Test 17: Terminal transforms (Ground, Abstract) must have no outgoing edges
+        rec2 = Recursor(pipeline=DEFAULT_PIPELINE, max_depth=4, max_minutes=1, rng_seed=5)
         g2 = rec2.recurse("Seed Bearer", consent=True)
         by_id = {n.id: n for n in g2.nodes}
         for e in g2.edges:
@@ -447,9 +696,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--minutes", type=int, default=30, help="Max session minutes (default: 30)")
     ap.add_argument("--out_json", default="echo_map.json", help="Output JSON file path")
     ap.add_argument("--out_md", default="echo_map.md", help="Output Markdown tree path")
+    ap.add_argument("--out_summary", default="echo_summary.md", help="Output summary Markdown path")
 
     ap.add_argument("--consent", action="store_true", help="Confirm user consent was obtained")
     ap.add_argument("--clinical", action="store_true", help="Clinical mode tag in metadata")
+    ap.add_argument(
+        "--branching",
+        type=int,
+        default=None,
+        help="Max transforms per node (always includes Ground when present)",
+    )
+    ap.add_argument("--rng_seed", type=int, default=None, help="Seed for deterministic transform sampling")
+    ap.add_argument(
+        "--novelty_threshold",
+        type=float,
+        default=None,
+        help="Skip transforms with novelty below this threshold (0.0-1.0)",
+    )
 
     ap.add_argument(
         "--run_tests",
@@ -472,16 +735,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     pipeline = DEFAULT_PIPELINE[:]  # Could be customized
-    rec = Recursor(pipeline=pipeline, max_depth=args.depth, max_minutes=args.minutes)
+    rec = Recursor(
+        pipeline=pipeline,
+        max_depth=args.depth,
+        max_minutes=args.minutes,
+        branching=args.branching,
+        rng_seed=args.rng_seed,
+        novelty_threshold=args.novelty_threshold,
+    )
     graph = rec.recurse(seed=seed, consent=args.consent, safety_level=("clinical" if args.clinical else "light"))
 
     with open(args.out_json, "w", encoding="utf-8") as f:
         f.write(to_json(graph))
     with open(args.out_md, "w", encoding="utf-8") as f:
         f.write(to_markdown_tree(graph))
+    with open(args.out_summary, "w", encoding="utf-8") as f:
+        f.write(to_summary_md(graph))
 
-    _stdout_write(f"Saved: {args.out_json} and {args.out_md}")
-    _stdout_write("Session complete. Suggest cool-down: 5 slow breaths, water, short walk.")
+    _stdout_write(f"Saved: {args.out_json}, {args.out_md}, and {args.out_summary}")
+    cooldown_rng = random.Random(args.rng_seed)
+    _stdout_write(pick_cooldown_message(cooldown_rng, args.clinical))
     return 0
 
 
