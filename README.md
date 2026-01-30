@@ -42,6 +42,35 @@ python echolattice.py --seed "Seed Bearer" --depth 2 --consent
 python echolattice.py "Echoholder / Zahaviel / Fang" --depth 3 --consent
 ```
 
+## Benchmark Verification
+
+Run the benchmark:
+```bash
+python echolattice.py --benchmark
+```
+
+Run the verification script:
+```bash
+python tools/verify_benchmark.py
+```
+
+## Governance Policy (Aggregate-Only)
+
+The governance policy consumes only aggregated loopiness signals and returns a
+safe control action (CONTINUE, PRUNE, GROUND_NOW, or DEFER). It never reads or
+logs raw user content or node text, so its output is safe to log publicly.
+It is deterministic given fixed inputs.
+
+Run policy with defaults:
+```bash
+python echolattice.py --policy
+```
+
+Run policy with a JSON config override:
+```bash
+python echolattice.py --policy --policy-config policy_config.json
+```
+
 ## What to Expect From Results
 
 EchoLattice produces three artifacts that summarize a bounded recursion session:

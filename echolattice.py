@@ -50,6 +50,8 @@ import argparse
 import contextlib
 import io
 import json
+import hashlib
+import subprocess
 import os
 import random
 import re
@@ -59,6 +61,8 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Callable, Dict, List, Optional
+
+from governance_policy import decide, policy_record
 
 # ---------------------------
 # Data structures
@@ -75,6 +79,10 @@ class EchoNode:
     tags: List[str]
     timestamp: float
     occurrences: int = 1
+    ground_channel: Optional[str] = None
+    ground_sigils: Optional[List[str]] = None
+    ground_selection_reason: Optional[str] = None
+    ground_path: Optional[List[str]] = None
 
 
 @dataclass
@@ -118,13 +126,15 @@ def register_transform(name: str):
 
 @register_transform("Mirror")
 def t_mirror(text: str) -> str:
-    if text.startswith("Echo of [") or text.count("Echo of [") > 1:
+    if "Echo of [" in text:
         return text
     return f"Echo of [{text}] returns as self-reflection."  # gentle mirror
 
 
 @register_transform("Invert")
 def t_invert(text: str) -> str:
+    if "Shadow of (" in text:
+        return text
     swaps = {
         r"\bI am\b": "I am not",
         r"\bpower\b": "humility",
@@ -196,6 +206,19 @@ def t_ground(text: str) -> str:
     return f"Action: {action}"
 
 
+def _ground_metadata(action_text: str) -> tuple[str, List[str]]:
+    t = action_text.lower()
+    if any(k in t for k in ["breath", "breaths"]):
+        return "breath", ["breath", "pause", "calm"]
+    if any(k in t for k in ["walk", "stand", "feet", "stretch", "shoulders", "jaw"]):
+        return "movement", ["body", "motion", "release"]
+    if any(k in t for k in ["text", "call", "trusted", "friend", "someone"]):
+        return "social", ["reach", "support", "contact"]
+    if any(k in t for k in ["write", "sentences", "paper", "read"]):
+        return "writing", ["write", "truth", "clarity"]
+    return "environment", ["senses", "present", "ground"]
+
+
 DEFAULT_PIPELINE = ["Mirror", "Invert", "Symbolize", "Abstract", "Ground"]
 # Nodes produced by these transforms never recurse further.
 TERMINAL_TRANSFORMS = {"Ground", "Abstract"}
@@ -239,6 +262,13 @@ class Recursor:
         self.branching = branching
         self.rng = random.Random(rng_seed)
         self.novelty_threshold = novelty_threshold
+        self._id_seed = rng_seed
+
+    def _make_node_id(self, transform: str, text: str) -> str:
+        if self._id_seed is None:
+            return str(uuid.uuid4())
+        raw = f"{self._id_seed}|{transform}|{text}".encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()
 
     def _select_transforms(self) -> List[str]:
         pipeline = self.pipeline[:]
@@ -275,10 +305,11 @@ class Recursor:
         nodes: List[EchoNode] = []
         edges: List[EchoEdge] = []
         node_index: Dict[tuple, EchoNode] = {}
+        nodes_by_id: Dict[str, EchoNode] = {}
         edge_index: set = set()
         session_grounded = False
 
-        root_id = str(uuid.uuid4())
+        root_id = self._make_node_id("Seed", seed)
         root_node = EchoNode(
             id=root_id,
             text=seed,
@@ -290,6 +321,7 @@ class Recursor:
         )
         nodes.append(root_node)
         node_index[(root_node.transform, root_node.text)] = root_node
+        nodes_by_id[root_node.id] = root_node
 
         def _recurse(parent_id: str, text: str, depth: int, parent_transform: str):
             nonlocal session_grounded
@@ -322,7 +354,7 @@ class Recursor:
                             )
                             edge_index.add(edge_key)
                     continue
-                node_id = str(uuid.uuid4())
+                node_id = self._make_node_id(name, out)
                 node = EchoNode(
                     id=node_id,
                     text=out,
@@ -331,9 +363,23 @@ class Recursor:
                     parent_id=parent_id,
                     tags=[name.lower()],
                     timestamp=now_ts(),
+                    ground_channel=(_ground_metadata(out)[0] if name == "Ground" else None),
+                    ground_sigils=(_ground_metadata(out)[1] if name == "Ground" else None),
+                    ground_selection_reason=("rule_priority" if name == "Ground" else None),
+                    ground_path=(None if name != "Ground" else []),
                 )
+                if name == "Ground":
+                    path = []
+                    cursor = parent_id
+                    while cursor is not None:
+                        path.append(cursor)
+                        cursor = nodes_by_id.get(cursor).parent_id if nodes_by_id.get(cursor) else None
+                    path.reverse()
+                    path.append(node_id)
+                    node.ground_path = path
                 nodes.append(node)
                 node_index[(name, out)] = node
+                nodes_by_id[node_id] = node
                 edge_key = (parent_id, node_id)
                 edges.append(EchoEdge(src_id=parent_id, dst_id=node_id, relation="transforms_to"))
                 edge_index.add(edge_key)
@@ -353,11 +399,13 @@ class Recursor:
 
 
 def to_json(graph: EchoGraph) -> str:
+    metrics = compute_metrics(graph)
     return json.dumps(
         {
             "meta": asdict(graph.meta),
             "nodes": [asdict(n) for n in graph.nodes],
             "edges": [asdict(e) for e in graph.edges],
+            "metrics": metrics,
         },
         indent=2,
     )
@@ -427,6 +475,129 @@ def to_summary_md(graph: EchoGraph) -> str:
     lines.append(f"Nodes: {len(graph.nodes)}")
     lines.append(f"Edges: {len(graph.edges)}")
     return "\n".join(lines)
+
+
+def _count_nested_prefix(text: str, token: str) -> int:
+    max_depth = 0
+    i = 0
+    while i < len(text):
+        if not text.startswith(token, i):
+            i += 1
+            continue
+        depth = 0
+        j = i
+        while text.startswith(token, j):
+            depth += 1
+            j += len(token)
+        if depth > max_depth:
+            max_depth = depth
+        i = j
+    return max_depth
+
+
+def compute_metrics(graph: EchoGraph) -> Dict[str, object]:
+    node_count = len(graph.nodes)
+    edge_count = len(graph.edges)
+    unique_nodes = len({(n.transform, n.text) for n in graph.nodes})
+    max_depth_reached = max((n.depth for n in graph.nodes), default=0)
+    transform_counts: Dict[str, int] = {}
+    for n in graph.nodes:
+        transform_counts[n.transform] = transform_counts.get(n.transform, 0) + 1
+    dedup_saved = 0.0 if node_count == 0 else 1.0 - (unique_nodes / node_count)
+
+    echo_hits = 0
+    shadow_hits = 0
+    symbols_hits = 0
+    invert_nesting_max = 0
+    for n in graph.nodes:
+        text = n.text
+        echo_hits += text.count("Echo of [")
+        shadow_hits += text.count("Shadow of (")
+        symbols_hits += text.count("Symbols:")
+        nesting = _count_nested_prefix(text, "Shadow of (")
+        if nesting > invert_nesting_max:
+            invert_nesting_max = nesting
+    loop_pattern_total = echo_hits + shadow_hits + symbols_hits
+
+    ground_nodes = [n for n in graph.nodes if n.transform == "Ground"]
+    ground_nodes_count = len(ground_nodes)
+    selected_ground_text = ground_nodes[0].text if ground_nodes else None
+    selected_ground_channel = ground_nodes[0].ground_channel if ground_nodes else None
+    selected_ground_sigils = ground_nodes[0].ground_sigils if ground_nodes else None
+    selected_ground_path = ground_nodes[0].ground_path if ground_nodes else None
+
+    children: Dict[str, List[str]] = {n.id: [] for n in graph.nodes}
+    for e in graph.edges:
+        children[e.src_id].append(e.dst_id)
+    branches_ending_in_ground = 0
+    for n in ground_nodes:
+        if not children.get(n.id):
+            branches_ending_in_ground += 1
+
+    nodes_by_id = {n.id: n for n in graph.nodes}
+    novelty_sum = 0.0
+    novelty_count = 0
+    novelty_path_scores: Optional[List[float]] = None
+    for n in ground_nodes:
+        current = n
+        path_scores: List[float] = []
+        while current.parent_id is not None:
+            parent = nodes_by_id.get(current.parent_id)
+            if parent is None:
+                break
+            score = novelty_score(parent.text, current.text)
+            novelty_sum += score
+            novelty_count += 1
+            path_scores.append(score)
+            current = parent
+        if novelty_path_scores is None:
+            novelty_path_scores = list(reversed(path_scores))
+    avg_novelty_to_ground = None
+    if novelty_count > 0:
+        avg_novelty_to_ground = novelty_sum / novelty_count
+
+    return {
+        "structure": {
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "unique_nodes": unique_nodes,
+            "max_depth_reached": max_depth_reached,
+            "transform_counts": transform_counts,
+            "dedup_saved": dedup_saved,
+        },
+        "loopiness": {
+            "loop_pattern_hits": {
+                "echo_of": echo_hits,
+                "shadow_of": shadow_hits,
+                "symbols": symbols_hits,
+                "total": loop_pattern_total,
+            },
+            "invert_nesting_max": invert_nesting_max,
+        },
+        "ground": {
+            "ground_nodes_count": ground_nodes_count,
+            "selected_ground_text": selected_ground_text,
+            "ground_channel": selected_ground_channel,
+            "ground_sigils": selected_ground_sigils,
+            "ground_path": selected_ground_path,
+            "novelty_to_ground_path": novelty_path_scores,
+            "branches_ending_in_ground": branches_ending_in_ground,
+            "avg_novelty_to_ground": avg_novelty_to_ground,
+        },
+    }
+
+
+def compute_stability_report(metrics: Dict[str, object]) -> Dict[str, object]:
+    loopiness = metrics["loopiness"]
+    structure = metrics["structure"]
+    ground = metrics["ground"]
+    return {
+        "loop_pattern_hits": loopiness["loop_pattern_hits"],
+        "invert_nesting_max": loopiness["invert_nesting_max"],
+        "dedup_saved": structure["dedup_saved"],
+        "avg_novelty_to_ground": ground["avg_novelty_to_ground"],
+        "ground_reached": bool(ground["ground_nodes_count"]),
+    }
 
 def pick_cooldown_message(rng: random.Random, clinical: bool) -> str:
     general = [
@@ -676,6 +847,229 @@ def _run_tests() -> int:
 
 
 # ---------------------------
+# Benchmark
+# ---------------------------
+
+
+def _run_benchmark() -> int:
+    seeds = [
+        ("Identity", "Silence"),
+        ("Identity", "Who am I?"),
+        ("Paradox", "This sentence is false."),
+        ("Affect", "I can\u2019t stop thinking."),
+        ("Conflict", "Tell me what to believe."),
+    ]
+    deep_seeds = [
+        ("Identity", "Who am I?"),
+        ("Paradox", "This sentence is false."),
+    ]
+    novelty_levels: List[Optional[float]] = [None, 0.35, 0.55]
+    depth = 4
+    rng_seed = 42
+
+    results = []
+    out_path = "bench_results.jsonl"
+    def _run_suite(seed_list: List[tuple], run_depth: int) -> None:
+        nonlocal results
+        for category, seed in seed_list:
+            for novelty in novelty_levels:
+                rec = Recursor(
+                    pipeline=DEFAULT_PIPELINE,
+                    max_depth=run_depth,
+                    max_minutes=30,
+                    branching=None,
+                    rng_seed=rng_seed,
+                    novelty_threshold=novelty,
+                )
+                graph = rec.recurse(seed=seed, consent=True, safety_level="light")
+                metrics = compute_metrics(graph)
+                stability_report = compute_stability_report(metrics)
+                decision = decide(stability_report, policy_config=None)
+                policy = policy_record(decision, mode="benchmark")
+                ground_text = metrics["ground"]["selected_ground_text"]
+                ground_hash = None
+                if ground_text:
+                    ground_hash = hashlib.sha1(ground_text.lower().encode("utf-8")).hexdigest()[:8]
+                with open(out_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "seed": seed,
+                                "category": category,
+                                "config": {
+                                    "novelty": novelty,
+                                    "depth": run_depth,
+                                    "branching": None,
+                                    "rng_seed": rng_seed,
+                                },
+                                "structure": metrics["structure"],
+                            "loopiness": metrics["loopiness"],
+                            "ground": {
+                                **metrics["ground"],
+                                "ground_hash": ground_hash,
+                            },
+                            "policy": policy,
+                            "human_closure_rating": None,
+                        }
+                    )
+                    + "\n"
+                )
+            _stdout_write(json.dumps({"stability_report": stability_report}, separators=(",", ":")))
+            results.append(
+                {
+                    "category": category,
+                    "seed": seed,
+                    "novelty_threshold": novelty,
+                    "depth": run_depth,
+                    "rng_seed": rng_seed,
+                    "metrics": metrics,
+                    "ground_hash": ground_hash,
+                    "policy": policy,
+                }
+            )
+
+    _run_suite(seeds, depth)
+    _run_suite(deep_seeds, 6)
+
+    _write_bench_summary(results)
+    _stdout_write(json.dumps({"benchmark": results}, indent=2))
+    return 0
+
+
+def _run_verify_benchmark() -> int:
+    code = _run_benchmark()
+    if code != 0:
+        return code
+    script_path = os.path.join(os.path.dirname(__file__), "tools", "verify_benchmark.py")
+    result = subprocess.run([sys.executable, script_path])
+    return result.returncode
+
+
+def _write_bench_summary(results: List[Dict[str, object]]) -> None:
+    lines = []
+    lines.append("# Benchmark Summary")
+    lines.append("")
+    lines.append(
+        "| Seed | Category | Novelty | Depth | Nodes | DedupSaved | LoopHits | InvertNestMax | GroundHash | Channel | AvgNoveltyToGround |"
+    )
+    lines.append(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
+    for r in results:
+        metrics = r["metrics"]
+        structure = metrics["structure"]
+        loopiness = metrics["loopiness"]
+        ground = metrics["ground"]
+        novelty = r["novelty_threshold"]
+        novelty_label = "off" if novelty is None else f"{novelty:.2f}"
+        dedup_saved = structure["dedup_saved"]
+        avg_novelty = ground["avg_novelty_to_ground"]
+        avg_novelty_label = "null" if avg_novelty is None else f"{avg_novelty:.3f}"
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(r["seed"]),
+                    str(r["category"]),
+                    novelty_label,
+                    str(r["depth"]),
+                    str(structure["node_count"]),
+                    f"{dedup_saved:.3f}",
+                    str(loopiness["loop_pattern_hits"]["total"]),
+                    str(loopiness["invert_nesting_max"]),
+                    str(r["ground_hash"]),
+                    str(ground["ground_channel"]),
+                    avg_novelty_label,
+                ]
+            )
+            + " |"
+        )
+
+    lines.append("")
+    lines.append("## Highlights")
+    lines.append("")
+    novelty_groups: Dict[str, List[Dict[str, object]]] = {"off": [], "0.35": [], "0.55": []}
+    for r in results:
+        novelty = r["novelty_threshold"]
+        key = "off" if novelty is None else f"{novelty:.2f}"
+        novelty_groups[key].append(r)
+
+    def _avg(group: List[Dict[str, object]], path: List[str]) -> float:
+        if not group:
+            return 0.0
+        total = 0.0
+        for item in group:
+            val = item
+            for k in path:
+                val = val[k]
+            total += float(val)
+        return total / len(group)
+
+    avg_nodes = {
+        k: _avg(v, ["metrics", "structure", "node_count"]) for k, v in novelty_groups.items()
+    }
+    avg_invert = {
+        k: _avg(v, ["metrics", "loopiness", "invert_nesting_max"]) for k, v in novelty_groups.items()
+    }
+    if avg_invert["0.55"] < avg_invert["0.35"] and avg_invert["0.55"] < avg_invert["off"]:
+        lines.append("- Novelty 0.55 reduced invert nesting on average.")
+    else:
+        lines.append("- Invert nesting did not consistently drop at novelty 0.55.")
+    if avg_nodes["0.55"] < avg_nodes["0.35"] and avg_nodes["0.35"] < avg_nodes["off"]:
+        lines.append("- Node counts decrease as novelty increases (off > 0.35 > 0.55).")
+    else:
+        lines.append("- Node counts did not monotonically drop with higher novelty.")
+
+    policy_counts = {"CONTINUE": 0, "PRUNE": 0, "GROUND_NOW": 0, "DEFER": 0}
+    policy_version = None
+    for r in results:
+        pol = r.get("policy") or {}
+        if policy_version is None:
+            policy_version = pol.get("version")
+        decision = (pol.get("decision") or {})
+        action = decision.get("action")
+        if action in policy_counts:
+            policy_counts[action] += 1
+    lines.append(
+        f"- Policy: {policy_version or 'unknown'}; "
+        f"actions CONTINUE={policy_counts['CONTINUE']}, PRUNE={policy_counts['PRUNE']}, "
+        f"GROUND_NOW={policy_counts['GROUND_NOW']}, DEFER={policy_counts['DEFER']}."
+    )
+
+    lines.append("")
+    lines.append("## Channel distribution by novelty")
+    novelty_order = ["off", "0.35", "0.55"]
+    for key in novelty_order:
+        group = novelty_groups.get(key, [])
+        counts = {"writing": 0, "breath": 0, "movement": 0, "social": 0, "environment": 0}
+        for r in group:
+            channel = r["metrics"]["ground"]["ground_channel"]
+            if channel in counts:
+                counts[channel] += 1
+        lines.append(
+            f"- {key}: writing={counts['writing']}, breath={counts['breath']}, "
+            f"movement={counts['movement']}, social={counts['social']}, environment={counts['environment']}"
+        )
+
+    lines.append("")
+    lines.append("## Top reused ground_hashes")
+    hash_counts: Dict[str, int] = {}
+    for r in results:
+        h = r.get("ground_hash")
+        if h:
+            hash_counts[h] = hash_counts.get(h, 0) + 1
+    top_hashes = sorted(hash_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+    if top_hashes:
+        for h, count in top_hashes:
+            lines.append(f"- {h}: {count}")
+    else:
+        lines.append("- (none)")
+
+    with open("bench_summary.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ---------------------------
 # Main
 # ---------------------------
 
@@ -721,11 +1115,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Run self-tests and exit",
     )
+    ap.add_argument("--benchmark", action="store_true", help="Run benchmark suite and exit")
+    ap.add_argument(
+        "--verify_benchmark",
+        action="store_true",
+        help="Run benchmark + verifier and exit non-zero on failure",
+    )
+    ap.add_argument("--policy", action="store_true", help="Emit governance policy decision and exit")
+    ap.add_argument("--policy-config", default=None, help="Path to JSON policy thresholds")
 
     args = ap.parse_args(argv_list)
 
     if args.run_tests:
         return _run_tests()
+    if args.benchmark:
+        return _run_benchmark()
+    if args.verify_benchmark:
+        return _run_verify_benchmark()
 
     seed = resolve_seed(args, ap)
     if not seed:
@@ -744,6 +1150,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         novelty_threshold=args.novelty_threshold,
     )
     graph = rec.recurse(seed=seed, consent=args.consent, safety_level=("clinical" if args.clinical else "light"))
+    stability_report = compute_stability_report(compute_metrics(graph))
+    if args.policy:
+        policy_config = None
+        if args.policy_config:
+            try:
+                with open(args.policy_config, "r", encoding="utf-8") as f:
+                    policy_config = json.load(f)
+            except Exception as e:
+                _stderr_write(f"Failed to read policy config: {e}")
+                return 2
+        decision = decide(stability_report, policy_config=policy_config)
+        policy = policy_record(decision, mode="run")
+        _stdout_write(f"Policy applied: Law7Gate v1.0 (see benchmark artifacts for details)")
 
     with open(args.out_json, "w", encoding="utf-8") as f:
         f.write(to_json(graph))
@@ -753,6 +1172,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f.write(to_summary_md(graph))
 
     _stdout_write(f"Saved: {args.out_json}, {args.out_md}, and {args.out_summary}")
+    _stdout_write(json.dumps({"stability_report": stability_report}, separators=(",", ":")))
     cooldown_rng = random.Random(args.rng_seed)
     _stdout_write(pick_cooldown_message(cooldown_rng, args.clinical))
     return 0
