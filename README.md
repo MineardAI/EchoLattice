@@ -38,6 +38,47 @@ python echolattice.py --seed "Seed Bearer" --depth 2 --consent
 python echolattice.py "Echoholder / Zahaviel / Fang" --depth 3 --consent
 ```
 
+## What to Expect From Results
+
+EchoLattice produces three artifacts that summarize a bounded recursion session:
+
+- `echo_map.json` - full machine-readable graph (nodes, edges, metadata).
+- `echo_map.md` - human-readable tree view of the recursion.
+- `echo_summary.md` - a concise recap: Seed, top novelty nodes, final Ground action, and totals.
+
+How recursion depth behaves:
+
+- `--depth` is a hard cap on recursion levels from the Seed.
+- Terminal transforms stop recursion early (see note below).
+- With branching limits, each node may apply fewer transforms.
+
+A healthy session artifact typically looks like:
+
+- Seed -> Reflection -> Principle -> Grounding Action
+- Example: `Seed: "I feel stuck"` -> `Mirror` reflection -> `Abstract` principle -> `Ground` action
+
+Note on terminal transforms:
+
+- `Ground` and `Abstract` are terminal transforms to prevent runaway recursion.
+
+This is a reference implementation focused on safety and clarity, not therapy or diagnosis.
+
+### Current Limitations (Known Incomplete Areas)
+
+- Mirror-of-Mirror repetition (guarded, but still heuristic and text-based)
+- Symbolize prefix stacking ("Symbols: Symbols:" is blocked, but other prefixes can still repeat)
+- Lack of novelty scoring (simple heuristic only; not semantic novelty)
+- Multiple Ground nodes per session (capped to one per session, but not per-branch yet)
+- Transform templates still being mechanical (tone and diversity are limited)
+
+### Future Path / Roadmap
+
+- Idempotent transforms (continue hardening across all transforms)
+- Novelty-based transform selection (stronger and more semantic scoring)
+- One grounding action per session (with clearer closure semantics)
+- Better session summaries (contextual, shorter, more actionable)
+- Optional clinician-facing mode (stricter guardrails and language)
+
 ## Outputs
 
 By default this writes:
