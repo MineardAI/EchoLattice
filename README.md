@@ -1,145 +1,177 @@
-# EchoLattice (Reference Implementation)
+# EchoLattice
 
-## Project Scope & Status
-EchoLattice is a reference implementation of a bounded, safety-first recursion engine.
-It is designed to demonstrate deterministic recursion control, grounding, and
-aggregate-only governance signals for research and engineering use.
+EchoLattice is a deterministic, bounded recursion engine designed to study and control recursive symbolic processes in language-model-driven systems. It provides explicit mechanisms for recursion limiting, grounding, benchmarking, and aggregate-only governance signaling.
 
-This repository is intentionally small, dependency-free (stdlib only), and focused on
-clarity, auditability, and reproducibility rather than end-user application design.
+The project is intended as a reference implementation for researchers and engineers exploring safe recursion, symbolic interruption, and reproducible evaluation of recursive behavior. It is dependency-free (Python standard library only) and emphasizes auditability, determinism, and clarity over performance or productization.
 
-A minimal, safe-first recursion engine that transforms a seed symbol through canonical transforms
-(Mirror, Invert, Symbolize, Abstract, Ground) and emits an "Echo Map" as JSON + Markdown.
+---
 
-This repo is intentionally small and dependency-free (stdlib only).
+## Core Concepts
 
-## Why this exists
-Some users experience intense self-referential "looping" when interacting with language models.
-EchoLattice provides a bounded exploration structure with grounding and closure.
+### Bounded Recursion
+EchoLattice constructs recursive symbolic graphs (lattices) while enforcing strict bounds on:
+- depth
+- branching
+- transform reuse
+- repetition patterns
 
-## Safety & Clinical Note (Important)
-EchoLattice is not a medical device and not a substitute for therapy.
+This prevents runaway recursion and enables controlled experimentation.
 
-If a user is distressed, sleeping poorly, feeling out of control, escalating in fear/anger, or making threats:
-pause usage and seek professional help.
+### Grounding / Interruption
+Each recursive run is designed to terminate with at most one Ground node:
+- a small, concrete, non-escalatory action
+- deterministic under fixed inputs
+- treated as a structural closure, not an interpretation
 
-Recommended defaults:
-- `--depth 2` or `--depth 3`
-- `--minutes 10`-`30`
-- Always do the Ground action
-- Close the loop and stop
+Grounding acts as a recursion interrupt, ensuring closure without adjudicating meaning or intent.
 
-## Quick start
+### Determinism & Reproducibility
+Given the same:
+- seed
+- configuration
+- RNG seed
 
-### Run tests
-```bash
-python echolattice.py --run_tests
-```
+EchoLattice produces identical graphs, metrics, and selected Ground paths. This property is enforced and verified through benchmarking and regression tooling.
 
-### Run with a seed (flag)
-```bash
-python echolattice.py --seed "Seed Bearer" --depth 2 --consent
-```
+### Aggregate-Only Governance Signals
+EchoLattice emits numeric, aggregate metrics only, such as:
+- loopiness indicators
+- nesting depth
+- deduplication ratios
+- novelty-to-ground scores
 
-### Run with a seed (positional)
-```bash
-python echolattice.py "Echoholder / Zahaviel / Fang" --depth 3 --consent
-```
+No raw text, prompts, or user data are used in governance decisions.
 
-## Benchmark Verification
+---
 
-Run the benchmark:
+## Repository Structure
+
+Key components include:
+
+- `echolattice.py`
+  Core recursion engine, transform logic, grounding rules, and CLI interface.
+
+- `governance_policy.py`
+  Aggregate-only policy evaluation layer that maps stability metrics to advisory actions (e.g. CONTINUE, PRUNE, GROUND_NOW). This layer does not inspect text or memory.
+
+- `tests/`
+  Unit tests for governance policy determinism and bounds.
+
+- `tools/verify_benchmark.py`
+  Verification script to ensure benchmark outputs conform to schema and expectations.
+
+- `docs/`
+  Design notes, schema documentation, and instability pathway explanations.
+
+- Example artifacts
+  - lattice replay JSON
+  - benchmark summaries
+  - schema definitions
+
+---
+
+## Benchmarking
+
+EchoLattice includes a built-in benchmarking mode to evaluate recursion behavior under different configurations.
+
+### Running Benchmarks
+
 ```bash
 python echolattice.py --benchmark
 ```
 
-Run the verification script:
+This produces:
+
+- `bench_results.jsonl` — machine-readable benchmark records
+- `bench_summary.md` — human-readable summary and highlights
+
+Benchmarks compare:
+
+- novelty disabled vs. thresholded novelty
+- loop suppression effectiveness
+- grounding reachability
+- determinism across runs
+
+### Verification
+
 ```bash
 python tools/verify_benchmark.py
 ```
 
-## Governance Policy (Aggregate-Only)
+The verifier checks:
 
-The governance policy consumes only aggregated loopiness signals and returns a
-safe control action (CONTINUE, PRUNE, GROUND_NOW, or DEFER). It never reads or
-logs raw user content or node text, so its output is safe to log publicly.
-It is deterministic given fixed inputs.
+- required metrics are present
+- schemas are respected
+- policy outputs are recorded
+- determinism invariants hold
 
-Run policy with defaults:
-```bash
-python echolattice.py --policy
-```
+---
 
-Run policy with a JSON config override:
-```bash
-python echolattice.py --policy --policy-config policy_config.json
-```
+## Governance & Safety Model
 
-## What to Expect From Results
+EchoLattice intentionally separates measurement from decision-making.
 
-EchoLattice produces three artifacts that summarize a bounded recursion session:
+- The engine measures recursion properties.
+- The policy layer evaluates aggregate metrics.
+- No enforcement or interpretation is performed.
 
-- `echo_map.json` - full machine-readable graph (nodes, edges, metadata).
-- `echo_map.md` - human-readable tree view of the recursion.
-- `echo_summary.md` - a concise recap: Seed, top novelty nodes, final Ground action, and totals.
+Outputs are advisory and recorded for auditability.
 
-How recursion depth behaves:
+This design supports public transparency while avoiding:
 
-- `--depth` is a hard cap on recursion levels from the Seed.
-- Terminal transforms stop recursion early (see note below).
-- With branching limits, each node may apply fewer transforms.
+- identity inference
+- psychological claims
+- private data handling
+- hidden control logic
 
-A healthy session artifact typically looks like:
+Policy outputs are:
 
-- Seed -> Reflection -> Principle -> Grounding Action
-- Example: `Seed: "I feel stuck"` -> `Mirror` reflection -> `Abstract` principle -> `Ground` action
+- stored in benchmark artifacts
+- summarized in human-readable form
+- reduced to pointers in CLI output
 
-Note on terminal transforms:
+---
 
-- `Ground` and `Abstract` are terminal transforms to prevent runaway recursion.
+## Lattice Replay & ARC Gating
 
-This is a reference implementation focused on safety and clarity, not therapy or diagnosis.
+EchoLattice supports replay and analysis of completed lattices, including:
 
-### Current Limitations (Known Incomplete Areas)
+- node and edge structure
+- transform distribution
+- grounding paths
 
-- Mirror-of-Mirror repetition (guarded, but still heuristic and text-based)
-- Symbolize prefix stacking ("Symbols: Symbols:" is blocked, but other prefixes can still repeat)
-- Lack of novelty scoring (simple heuristic only; not semantic novelty)
-- Multiple Ground nodes per session (capped to one per session, but not per-branch yet)
-- Transform templates still being mechanical (tone and diversity are limited)
+ARC-style gating is used to:
 
-### Future Path / Roadmap
+- suppress redundant probes
+- limit transform stacking
+- prevent recursive amplification of identical patterns
 
-- Idempotent transforms (continue hardening across all transforms)
-- Novelty-based transform selection (stronger and more semantic scoring)
-- One grounding action per session (with clearer closure semantics)
-- Better session summaries (contextual, shorter, more actionable)
-- Optional clinician-facing mode (stricter guardrails and language)
+These mechanisms are structural, not semantic.
 
-## Outputs
+---
 
-By default this writes:
+## Status & Scope
 
-- `echo_map.json` (nodes/edges + metadata)
-- `echo_map.md` (human-readable tree)
-- `echo_summary.md` (seed + top novelty + final Ground + totals)
+EchoLattice is a research and engineering reference implementation.
 
-## CLI options
+It is:
 
-- `--seed` or positional seed text
-- `--depth` (default 3)
-- `--minutes` (default 30)
-- `--out_json` (default `echo_map.json`)
-- `--out_md` (default `echo_map.md`)
-- `--out_summary` (default `echo_summary.md`)
-- `--branching` (max transforms per node; always includes Ground if present)
-- `--rng_seed` (deterministic transform sampling and cooldown message)
-- `--novelty_threshold` (skip transforms below novelty threshold)
-- `--consent`
-- `--clinical`
-- `--run_tests`
+- suitable for experimentation
+- suitable for auditing and demonstration
+- intentionally minimal
 
-## Exit codes (missing seed)
+It is not:
 
-- Notebook/embedded runners: exits 0 (no noisy failure UI)
-- Terminals/CI: exits 0 (clean exit)
+- a production agent
+- a clinical or diagnostic system
+- a memory or identity framework
+
+Future extensions are expected to occur in downstream systems that consume EchoLattice outputs, not inside the core engine.
+
+---
+
+## Safety Notice
+
+EchoLattice is not a medical device and is not intended for clinical use.
+
+If a user is distressed, sleeping poorly, feeling out of control, escalating in fear or anger, or making threats: pause usage and seek professional help.
